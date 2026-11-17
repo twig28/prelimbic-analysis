@@ -7,43 +7,39 @@ output: html_document
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
-#output wkdir
-wkdir = "C:/Users/jacwe/OneDrive/Documents/scRNAseq/mouse"
-
-#where input data is 
-inputdir1 = "C:/Users/jacwe/Downloads/R/samples/1-4/DGE_unfiltered"
-inputdir2 = "C:/Users/jacwe/Downloads/R/samples/5-8/DGE_unfiltered"
-object_names = c("pls_object1", "pls_object2")
-
-#where this file is
-sourcedir = "C:/Users/jacwe/Downloads/R/"
-
-if (!require("BiocManager", quietly = TRUE))
-    install.packages("BiocManager")
-
 set.seed(67)
 
-#BiocManager::install(c("scRNAseq", "SingleR", "celldex", "scuttle", "scrapper"))
-#install.packages('presto', repos = c('https://cran.r-universe.dev', 'https://cloud.r-project.org'))
+# Repo root
+repo_dir = getwd()
 
-require(dplyr)
-require(Seurat)
-require(ggplot2)
-require(plotly)
-require(patchwork)
-require(Matrix)
-require(devtools)
-require(SingleR)
-require(celldex)
-require(scRNAseq)
-require(presto)
-#for doubletFinder do:
-#devtools::install_github("chris-mcginnis-ucsf/DoubletFinder")
-require(DoubletFinder)
-source(paste0(sourcedir, "/scFunctions.R"))
+# Output directory
+wkdir = "C:/Users/jacwe/OneDrive/Documents/scRNAseq/rat"
 
-#uncomment for GPU USE 
-require(ggmlR)
+# Input data, relative to the repo
+inputdir1 = file.path(repo_dir, "samples", "1-4", "DGE_unfiltered")
+inputdir2 = file.path(repo_dir, "samples", "5-8", "DGE_unfiltered")
+object_names = c("pls_object1", "pls_object2")
+
+# Install once if needed:
+# install.packages(c("dplyr", "Seurat", "ggplot2", "plotly", "patchwork", "Matrix", "BiocManager", "remotes"))
+# BiocManager::install(c("SingleR", "celldex", "scRNAseq", "scuttle", "scrapper"))
+# install.packages("presto", repos = c("https://cran.r-universe.dev", "https://cloud.r-project.org"))
+# remotes::install_github("chris-mcginnis-ucsf/DoubletFinder")
+
+library(dplyr)
+library(Seurat)
+library(ggplot2)
+library(plotly)
+library(patchwork)
+library(Matrix)
+library(SingleR)
+library(celldex)
+library(scRNAseq)
+library(presto)
+library(DoubletFinder)
+# library(ggmlR)  # uncomment for GPU use
+
+source(file.path(repo_dir, "scFunctions.R"))
 
 knitr::opts_knit$set(root.dir = wkdir)
 ```
