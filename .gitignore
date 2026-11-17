@@ -2,6 +2,7 @@
 # See objects/README.md for what each file is and where to get it.
 *.rds
 *.mtx
+cell_metadata.csv
 
 # Keep placeholder files for empty folders
 !.gitkeep
