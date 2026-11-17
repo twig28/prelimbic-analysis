@@ -1,0 +1,548 @@
+---
+title: "Pls_SingleCell_Analysis"
+author: "Jack Webb, Max Mcleod"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#output wkdir
+wkdir = "C:/Users/jacwe/OneDrive/Documents/scRNAseq/mouse"
+
+#where input data is 
+inputdir1 = "C:/Users/jacwe/Downloads/R/samples/1-4/DGE_unfiltered"
+inputdir2 = "C:/Users/jacwe/Downloads/R/samples/5-8/DGE_unfiltered"
+object_names = c("pls_object1", "pls_object2")
+
+#where this file is
+sourcedir = "C:/Users/jacwe/Downloads/R/"
+
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+set.seed(67)
+
+#BiocManager::install(c("scRNAseq", "SingleR", "celldex", "scuttle", "scrapper"))
+#install.packages('presto', repos = c('https://cran.r-universe.dev', 'https://cloud.r-project.org'))
+
+require(dplyr)
+require(Seurat)
+require(ggplot2)
+require(plotly)
+require(patchwork)
+require(Matrix)
+require(devtools)
+require(SingleR)
+require(celldex)
+require(scRNAseq)
+require(presto)
+#for doubletFinder do:
+#devtools::install_github("chris-mcginnis-ucsf/DoubletFinder")
+require(DoubletFinder)
+source(paste0(sourcedir, "/scFunctions.R"))
+
+#uncomment for GPU USE 
+require(ggmlR)
+
+knitr::opts_knit$set(root.dir = wkdir)
+```
+
+## Create Seurat Object
+
+```{r Create Seurat Object}
+inputdirs = c(pls_object1 = inputdir1, pls_object2 = inputdir2)
+
+for (obj_name in object_names) {
+  expression_matrix = Seurat::ReadParseBio(inputdirs[[obj_name]])
+  cell_meta = read.csv(paste0(inputdirs[[obj_name]], "/cell_metadata.csv"), row.names = 1)
+
+  pls_object = Seurat::CreateSeuratObject(counts = expression_matrix, meta = cell_meta)
+
+  #Matrix no longer needed in memory
+  rm(expression_matrix)
+
+  #note Mt capitalization
+  pls_object[["percent.mt"]] = Seurat::PercentageFeatureSet(pls_object, pattern = "^Mt-")
+
+  print(paste0(obj_name, " - some unique percent.mt's found:"))
+  print(head(unique(pls_object@meta.data$percent.mt)))
+
+  #Save Basic Seurat Object
+  saveRDS(pls_object, file.path(wkdir, paste0(obj_name, ".rds")))
+}
+```
+
+## Per Sample QC
+
+```{r qc}
+qc_widgets = list()
+
+for (obj_name in object_names) {
+  pls_object = readRDS(file.path(wkdir, paste0(obj_name, ".rds")))
+
+  # before filtering, histogram plot will save to wkdir and be usable for interactivity
+  preqc_plot = plot_qc(pls_object, wkdir, stage = paste0(obj_name, "_pre_filter"),
+                       title = paste0(sub("pls_object", "Sample", obj_name), " Histogram (pre filter)"))
+  
+  #Violin per sample
+  pre_vln = suppressWarnings(
+    VlnPlot(pls_object,
+            features = c("nCount_RNA", "nFeature_RNA", "percent.mt"),
+            group.by = "sample",
+            
+            ncol = 3, pt.size = 0) &
+      ggplot2::theme(axis.title.x = ggplot2::element_blank(),
+                     axis.text.x  = ggplot2::element_text(angle = 45, hjust = 1)) &
+      NoLegend()
+  )
+    
+  print(pre_vln + patchwork::plot_annotation(
+    title = paste0(sub("pls_object", "Sample", obj_name), " Violin (pre filter)")))
+    
+  n_pre = ncol(pls_object)
+
+  # FILTER METRICS
+  pls_object = subset(pls_object, subset = nCount_RNA <= 80000 & 
+                        nCount_RNA >= 1250 & 
+                        nFeature_RNA <= 9000 & 
+                        nFeature_RNA >= 500 & 
+                        percent.mt < 0.5)
+
+  # after filtering
+  postqc_plot = plot_qc(pls_object, wkdir, stage = paste0(obj_name, "_post_filter"),
+                        title = paste0(sub("pls_object", "Sample", obj_name), " Histogram"))
+    
+  #Violin per sample
+  post_vln = suppressWarnings(
+    VlnPlot(pls_object,
+            features = c("nCount_RNA", "nFeature_RNA", "percent.mt"),
+            group.by = "sample",
+            ncol = 3, pt.size = 0) &
+      ggplot2::theme(axis.title.x = ggplot2::element_blank(),
+                     axis.text.x  = ggplot2::element_text(angle = 45, hjust = 1)) &
+      NoLegend()
+  )
+  
+  print(post_vln + patchwork::plot_annotation(
+        title = paste0(sub("pls_object", "Sample", obj_name), " Violin (post filter)")))
+  
+  n_post = ncol(pls_object)
+
+  message(sprintf("%s | Pre-filter: %s | Post-filter: %s | Removed: %s (%.1f%%)", obj_name,
+                  format(n_pre, big.mark = ","), format(n_post, big.mark = ","),
+                  format(n_pre - n_post, big.mark = ","), 100 * (n_pre - n_post) / n_pre))
+
+  saveRDS(pls_object, file.path(wkdir, paste0(obj_name, "_qc_filtered.rds")))
+
+  qc_widgets[[obj_name]] = postqc_plot$histogram_interactive
+}
+
+htmltools::tagList(qc_widgets)
+
+#remove large preqc plots from memory
+rm(pre_vln)
+rm(preqc_plot)
+```
+
+## DoubletFinder Package for flagging Doublets
+
+```{r doubletfinder}
+##This is Subjective - based on expected doublet percentage after cutoffs, going with 0.05
+doublet_rate = 0.05
+##
+
+pcs_used = 1:20 
+
+for (obj_name in object_names) {
+  pls_object = readRDS(file.path(wkdir, paste0(obj_name, "_qc_filtered.rds")))
+
+  obj_list = SplitObject(pls_object, split.by = "sample")
+
+  obj_list = lapply(obj_list, function(obj) {
+    # preprocessing DoubletFinder needs
+    obj = NormalizeData(obj)
+    obj = FindVariableFeatures(obj, selection.method = "vst", nfeatures = 2000)
+    obj = ScaleData(obj)
+    obj = RunPCA(obj, npcs = max(pcs_used))
+    obj = FindNeighbors(obj, dims = pcs_used)
+    obj = FindClusters(obj, resolution = 0.5)
+    
+    # pK selection
+    sweep_res   = paramSweep(obj, PCs = pcs_used, sct = FALSE)
+    sweep_stats = summarizeSweep(sweep_res, GT = FALSE)
+    bcmvn       = find.pK(sweep_stats)
+    optimal_pK  = as.numeric(as.character(bcmvn$pK[which.max(bcmvn$BCmetric)]))
+    
+    message(sprintf("n cells: %d | optimal pK: %s", ncol(obj), optimal_pK))
+    
+    # expected doublets
+    homotypic_prop = modelHomotypic(obj$seurat_clusters)
+    nExp_poi       = round(doublet_rate * ncol(obj))
+    nExp_adj       = round(nExp_poi * (1 - homotypic_prop))
+    
+    obj <- doubletFinder(obj, PCs = pcs_used, pN = 0.25, pK = optimal_pK,
+                         nExp = nExp_adj, reuse.pANN = NULL, sct = FALSE)
+    
+    # DoubletFinder's column names differ per sample; copy to common names
+    df_col   <- grep("^DF.classifications", colnames(obj@meta.data), value = TRUE)
+    pann_col <- grep("^pANN", colnames(obj@meta.data), value = TRUE)
+    obj$doublet_class <- obj@meta.data[[tail(df_col, 1)]]
+    obj$doublet_score <- obj@meta.data[[tail(pann_col, 1)]]
+    obj
+  })
+
+  pls_object <- merge(obj_list[[1]], y = obj_list[-1])
+  rm(obj_list)
+
+  print(obj_name)
+  df_table <- table(pls_object$sample, pls_object$doublet_class)
+  print(df_table)
+  print(round(100 * prop.table(df_table, margin = 1), 1))
+
+  # doublets should have higher nCount/nFeature than singlets broadly speaking
+  print(suppressWarnings(
+    VlnPlot(pls_object, features = c("nCount_RNA", "nFeature_RNA"),
+            group.by = "doublet_class", pt.size = 0) & NoLegend()
+  ))
+
+  # doublets are labeled but NOT removed yet
+  pls_object <- JoinLayers(pls_object)
+
+  saveRDS(pls_object, file.path(wkdir, paste0(obj_name, "_doublets_called.rds")))
+}
+```
+
+## Merge the two four sample runs, pls_object will be all 8 samples from here on out
+
+```{r merge}
+run1 = readRDS(file.path(wkdir, "pls_object1_doublets_called.rds"))
+run2 = readRDS(file.path(wkdir, "pls_object2_doublets_called.rds"))
+
+run1$run = "run1"
+run2$run = "run2"
+run1$sample_id = paste("run1", run1$sample, sep = "_")
+run2$sample_id = paste("run2", run2$sample, sep = "_")
+
+pls_object = merge(run1, y = run2, add.cell.ids = c("run1", "run2"))
+pls_object = JoinLayers(pls_object)
+rm(run1, run2)
+
+print(table(pls_object$sample_id))   # should list all 8 samples
+
+saveRDS(pls_object, file.path(wkdir, "pls_object_merged.rds"))
+
+```
+
+## Dimensional Reduction and Normalization Post-Merge
+
+```{r dim-reduction-normalization}
+pls_object = readRDS(paste0(wkdir, "/pls_object_merged.rds"))
+
+pls_object = NormalizeData(pls_object)
+
+pls_object = FindVariableFeatures(pls_object, selection.method = "vst", nfeatures = 2000)
+
+pls_object = ScaleData(pls_object)
+
+pls_object = RunPCA(pls_object, npcs = 35)
+
+ElbowPlot(pls_object, ndims = 50)
+
+```
+
+## Clustering and Umap Pre-Cleaning
+
+```{r clustering-umap-pre}
+dims_used = 1:30
+res = 0.4
+
+pls_object = FindNeighbors(pls_object, dims = dims_used)
+pls_object = FindClusters(pls_object, resolution = res)
+pls_object = RunUMAP(pls_object, dims = dims_used)
+
+# simple dimplots for which of the 2 runs, all 8 sample_ids and seurat clusters found
+print(DimPlot(pls_object, group.by = "run", shuffle = TRUE))
+print(DimPlot(pls_object, group.by = "sample_id", shuffle = TRUE))
+print(DimPlot(pls_object, group.by = "seurat_clusters", label = TRUE, repel = TRUE) + NoLegend())
+
+# interactive; hover shows run, sample, cluster, doublet call and QC metrics
+umap_widget = function(obj, color_by, title, colors = NULL, level_order = NULL, max_cells = 60000) {
+  emb = Seurat::Embeddings(obj, "umap")
+  md  = obj@meta.data
+  keep = if (nrow(md) > max_cells) sort(sample(nrow(md), max_cells)) else seq_len(nrow(md))
+  emb = emb[keep, ]; md = md[keep, ]
+  df = data.frame(
+    x = emb[, 1], y = emb[, 2],
+    group = if (is.null(level_order)) as.factor(md[[color_by]]) else factor(md[[color_by]], levels = level_order),
+    hover = paste0("run: ", md$run,
+                   "<br>sample: ", md$sample_id,
+                   "<br>cluster: ", md$seurat_clusters,
+                   "<br>doublet: ", md$doublet_class,
+                   "<br>doublet score: ", round(md$doublet_score, 2),
+                   "<br>nFeature: ", md$nFeature_RNA,
+                   "<br>nCount: ", md$nCount_RNA))
+  plotly::plot_ly(df, x = ~x, y = ~y, color = ~group, colors = colors,
+                  type = "scattergl", mode = "markers",
+                  text = ~hover, hoverinfo = "text",
+                  marker = list(size = 3, opacity = 0.7)) |>
+    plotly::layout(title = title,
+                   xaxis = list(title = "UMAP_1"), yaxis = list(title = "UMAP_2"))
+}
+
+set.seed(67)
+htmltools::tagList(list(
+  umap_widget(pls_object, "run",             "UMAP by run"),
+  umap_widget(pls_object, "sample_id",       "UMAP by sample"),
+  umap_widget(pls_object, "seurat_clusters", "UMAP by Seurat cluster"),
+  umap_widget(pls_object, "doublet_class",   "UMAP by doublet call",
+              colors = c(Doublet = "red", Singlet = "grey80"),
+              level_order = c("Singlet", "Doublet"))
+))
+
+saveRDS(pls_object, file.path(wkdir, "pls_object_before_cleaning.rds"))
+```
+
+## Cell Annotation - SingleR
+
+```{r annotation-singler}
+# log-normalized expression from the current object
+test_mat <- LayerData(pls_object, assay = "RNA", layer = "data")
+
+# Zeisel 2015 (mouse cortex/hippocampus, single-cell) ----
+ref_zeisel <- scRNAseq::ZeiselBrainData()
+ref_zeisel <- scuttle::logNormCounts(ref_zeisel)
+print(table(ref_zeisel$level1class))
+print(length(intersect(rownames(test_mat), rownames(ref_zeisel))))   # shared genes
+
+pred_zeisel <- SingleR(test = test_mat, ref = ref_zeisel,
+                       labels = ref_zeisel$level1class,
+                       de.method = "wilcox", aggr.ref = TRUE)
+pls_object$singler_zeisel <- pred_zeisel$pruned.labels
+print(table(pls_object$singler_zeisel, useNA = "ifany"))
+
+print(DimPlot(pls_object, reduction = "umap", group.by = "singler_zeisel",
+              label = TRUE, repel = TRUE, shuffle = TRUE))
+
+# Compare the annotation against the clusters ------------------------------
+tab = table(cluster = pls_object$seurat_clusters, label = pls_object$singler_zeisel, useNA = "ifany")
+pct = round(100 * prop.table(tab, margin = 1), 1)
+print(data.frame(cluster = rownames(pct),
+                 top_label = colnames(pct)[apply(pct, 1, which.max)],
+                 top_pct = apply(pct, 1, max),
+                 n = as.vector(rowSums(tab))), row.names = FALSE)
+
+saveRDS(pls_object, file.path(wkdir, "pls_object_before_cleaning.rds"))
+```
+
+## Cleaning based on Annotation and clustering results; remove doublets and background
+
+```{r cleaning}
+pls_object = readRDS(paste0(wkdir, "/pls_object_before_cleaning.rds"))
+pls_object$cluster_before_removal = pls_object$seurat_clusters
+md = pls_object@meta.data
+cl = as.character(md$seurat_clusters)
+dims_used = 1:30
+
+# ---- cutoffs: doublets ----
+thr_doublet = 25   # % of cells flagged by DoubletFinder
+thr_na      = 30   # % of cells with no Zeisel label
+thr_mixed   = 10   # % of cells co-expressing two lineages (also needs top-quartile % and above-median depth)
+expr_cut    = 1    # log-normalized value a gene must exceed to count as expressed
+# ---- cutoffs: background / low quality ----
+thr_low_umi = 6000 # only clusters with median UMIs at or below this can be called background
+thr_purity  = 0.5  # lineage purity below this = blended profile
+thr_sample  = 40   # % of a cluster from one sample above this = lopsided
+
+# =====================  TABLE 1: SUSPECTED DOUBLET CLUSTERS  =====================
+# marker sets that should not be expressed in the same nucleus: list(side A genes, side B genes)
+contradictions = list(
+  excit_inhib = list("Slc17a7", c("Gad1", "Gad2")),
+  neuron_glia = list("Snap25",  c("Plp1", "Slc1a3", "Cx3cr1"))
+)
+genes = unique(unlist(contradictions))
+if (length(setdiff(genes, rownames(pls_object))))
+  message("Markers not found: ", paste(setdiff(genes, rownames(pls_object)), collapse = ", "))
+ex   = FetchData(pls_object, vars = intersect(genes, rownames(pls_object)), layer = "data") > expr_cut
+side = function(g) { g = intersect(g, colnames(ex)); if (length(g)) rowSums(ex[, g, drop = FALSE]) > 0 else rep(FALSE, nrow(ex)) }
+mixed_by = sapply(contradictions, function(p) side(p[[1]]) & side(p[[2]]))   # cells x contradictions
+
+dbl = md |>
+  dplyr::mutate(mixed = rowSums(mixed_by) > 0) |>
+  dplyr::group_by(cluster = as.character(seurat_clusters)) |>
+  dplyr::summarise(n = dplyr::n(),
+                   med_umi       = median(nCount_RNA),
+                   pct_doublet   = round(100 * mean(doublet_class == "Doublet"), 1),
+                   pct_na_zeisel = round(100 * mean(is.na(singler_zeisel)), 1),
+                   pct_mixed     = round(100 * mean(mixed), 1)) |>
+  as.data.frame()
+
+mp = rowsum(mixed_by + 0, cl)   # which contradiction drives each cluster's mixed %
+dbl$mixed_pair = ifelse(rowSums(mp) == 0, "", colnames(mp)[max.col(mp, ties.method = "first")])[match(dbl$cluster, rownames(mp))]
+
+f = cbind(doublet = dbl$pct_doublet >= thr_doublet,
+          NA_     = dbl$pct_na_zeisel >= thr_na,
+          mixed   = dbl$pct_mixed >= thr_mixed & dbl$pct_mixed >= quantile(dbl$pct_mixed, 0.75) &
+                    dbl$med_umi >= median(dbl$med_umi))   # real doublets carry more RNA
+dbl$flags   = apply(f, 1, function(x) paste(c("doublet", "NA", "mixed")[x], collapse = " + "))
+dbl$verdict = ifelse(rowSums(f) >= 2, "REMOVE?", ifelse(rowSums(f) == 1, "check", "keep"))
+dbl = dbl[order(match(dbl$verdict, c("REMOVE?", "check", "keep")), -dbl$pct_doublet),
+          c("cluster", "n", "verdict", "flags", "pct_doublet", "pct_na_zeisel", "pct_mixed", "med_umi", "mixed_pair")]
+write.csv(dbl, file.path(wkdir, "cluster_doublet_table.csv"), row.names = FALSE)
+knitr::kable(dbl, row.names = FALSE, caption = "Suspected doublet clusters (REMOVE? = 2+ flags, check = 1).")
+
+# ==================  TABLE 2: SUSPECTED BACKGROUND / LOW-QUALITY CLUSTERS  ==================
+cls = dbl$cluster
+
+# lineage purity: one lineage expressed cleanly (near 1), or a blend of everything (low)?
+lineages = list(neuron = c("Snap25", "Rbfox3", "Syt1", "Stmn2"), oligo = c("Mog", "Mobp", "Mag", "Opalin"),
+                opc = c("Pdgfra", "Cspg4", "Vcan"), astro = c("Aqp4", "Gja1", "Aldh1l1", "Slc1a3"),
+                micro = c("Cx3cr1", "P2ry12", "Csf1r", "Tmem119"), endo = c("Flt1", "Cldn5", "Pecam1", "Vwf"),
+                epend = c("Foxj1", "Ttr"))
+lg  = Filter(length, lapply(lineages, intersect, rownames(pls_object)))
+ld  = as.matrix(FetchData(pls_object, vars = unique(unlist(lg)), layer = "data"))
+cm  = rowsum(ld, cl)[cls, , drop = FALSE] / as.vector(table(cl)[cls])
+rel = sapply(lg, function(g) rowMeans(cm[, g, drop = FALSE]))
+rel = sweep(rel, 2, pmax(apply(rel, 2, max), 1e-9), "/")   # 1 = the cluster with the most of that lineage
+purity = apply(rel, 1, max) / rowSums(rel)
+
+# cluster-specific markers and spread across samples
+Idents(pls_object) = "cluster_before_removal"
+mk = FindAllMarkers(pls_object, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.5,
+                    max.cells.per.ident = 300, verbose = FALSE)
+n_markers  = table(factor(as.character(mk$cluster[mk$p_val_adj < 0.01 & mk$pct.2 < 0.3]), levels = cls))
+max_sample = apply(prop.table(table(cl, md$sample_id), 1), 1, max)[cls] * 100
+
+bg = data.frame(cluster = cls, n = dbl$n,
+                med_umi     = dbl$med_umi,
+                med_genes   = as.vector(tapply(md$nFeature_RNA, cl, median)[cls]),
+                purity      = round(purity[cls], 2),
+                top_lineage = colnames(rel)[apply(rel, 1, which.max)],
+                n_markers   = as.vector(n_markers[cls]),
+                max_sample_pct = round(max_sample, 1),
+                doublet_verdict = dbl$verdict, row.names = NULL)
+
+f = cbind(blend    = bg$purity < thr_purity,
+          few_mk   = bg$n_markers <= quantile(bg$n_markers, 0.25),
+          lopsided = bg$max_sample_pct >= thr_sample)
+low = bg$med_umi <= thr_low_umi
+bg$flags   = apply(f, 1, function(x) paste(c("blend", "few markers", "lopsided")[x], collapse = " + "))
+bg$verdict = ifelse(low & rowSums(f) >= 2, "REMOVE?", ifelse((low & rowSums(f) == 1) | (!low & rowSums(f) >= 3), "check", "keep"))
+bg = bg[order(match(bg$verdict, c("REMOVE?", "check", "keep")), bg$med_umi),
+        c("cluster", "n", "verdict", "flags", "med_umi", "med_genes", "purity", "top_lineage",
+          "n_markers", "max_sample_pct", "doublet_verdict")]
+write.csv(bg, file.path(wkdir, "cluster_background_table.csv"), row.names = FALSE)
+knitr::kable(bg, row.names = FALSE, caption = "Suspected background / low-quality clusters (REMOVE? = low depth + 2 or more flags, check = low depth + 1).")
+
+# ==================  TABLE 3: TOP MARKER GENES PER ORIGINAL CLUSTER  ==================
+# reuses mk from Table 2 (Wilcoxon, min.pct 0.25, logFC >= 0.5, max 300 cells per cluster)
+top10 = mk |>
+  dplyr::filter(p_val_adj < 0.01) |>
+  dplyr::group_by(cluster) |>
+  dplyr::slice_max(avg_log2FC, n = 10, with_ties = FALSE) |>
+  dplyr::ungroup() |>
+  as.data.frame()
+top10$cluster = as.character(top10$cluster)
+top10$unnamed = grepl("^ENSRNOG|^LOC[0-9]|^AABR", top10$gene)   # no usable gene symbol
+write.csv(top10, file.path(wkdir, "cluster_top10_markers_long.csv"), row.names = FALSE)
+
+# doublet check: share of a cluster's top 10 that also appears in the top 10 of two OTHER clusters
+# (a doublet cluster has no genes of its own: its markers are the union of its two parents')
+sets  = split(top10$gene, top10$cluster)
+cover = t(sapply(cls, function(k) {
+  others = setdiff(names(sets), k)
+  if (length(sets[[k]]) == 0 || length(others) < 2) return(c(NA, NA))
+  prs = combn(others, 2)
+  fr  = apply(prs, 2, function(p) mean(sets[[k]] %in% unlist(sets[p])))
+  c(round(max(fr), 2), paste(prs[, which.max(fr)], collapse = "+"))
+}))
+
+tbl3 = data.frame(cluster = cls, n = dbl$n,
+                  doublet_verdict    = dbl$verdict,
+                  background_verdict = bg$verdict[match(cls, bg$cluster)],
+                  top_genes     = sapply(cls, function(k) paste(sets[[k]], collapse = ", ")),
+                  n_unnamed     = sapply(cls, function(k) sum(top10$unnamed[top10$cluster == k])),
+                  top10_covered = as.numeric(cover[, 1]),
+                  covered_by    = cover[, 2], row.names = NULL)
+tbl3 = tbl3[order(as.numeric(tbl3$cluster)), ]
+write.csv(tbl3, file.path(wkdir, "cluster_top_markers_table.csv"), row.names = FALSE)
+knitr::kable(tbl3, row.names = FALSE, caption = "Top 10 marker genes per original cluster. top10_covered = share of the top 10 found in the top 10 of the two clusters in covered_by (near 1 = no genes of its own).")
+
+# ---- clusters to remove (pre-removal numbers from the tables above); comment out to keep --------------------------------
+drop_clusters = character(0)
+drop_clusters = c(drop_clusters, "19") #Doublet, 44.7	38.5	55.7
+drop_clusters = c(drop_clusters, "13") #Doublet, 42.7	32.3	76.9	
+drop_clusters = c(drop_clusters, "22") #Doublet, 38.5	36.3	77.3	 
+drop_clusters = c(drop_clusters, "20") #Doublet top markers = union of clusters 6 and 14; 60.7k UMIs ~ sum of both (28.9k + 22.3k)
+drop_clusters = c(drop_clusters, "1")  #Background / Bad Quality, 1765.0	1075.0	0.75	neuron	27	
+
+# ---- remove doublets and chosen clusters ----
+n_before = ncol(pls_object)
+
+pls_object = subset(pls_object, cells = colnames(pls_object)[
+  pls_object$doublet_class == "Singlet" &
+  !(as.character(pls_object$cluster_before_removal) %in% drop_clusters)])
+message(sprintf("First Pass: Before: %s | After: %s | Removed: %s (%.1f%%)",
+                format(n_before, big.mark = ","), format(ncol(pls_object), big.mark = ","),
+                format(n_before - ncol(pls_object), big.mark = ","),
+                100 * (n_before - ncol(pls_object)) / n_before))
+
+# reprocess on the remaining cells
+pls_object = NormalizeData(pls_object)
+pls_object = FindVariableFeatures(pls_object, selection.method = "vst", nfeatures = 2000)
+pls_object = ScaleData(pls_object)
+pls_object = RunPCA(pls_object, npcs = 50)
+pls_object = FindNeighbors(pls_object, dims = dims_used)
+pls_object = FindClusters(pls_object, resolution = 0.2)
+pls_object = RunUMAP(pls_object, dims = dims_used)
+
+print(DimPlot(pls_object, group.by = "seurat_clusters", label = TRUE, repel = TRUE) + NoLegend())
+print(DimPlot(pls_object, group.by = "singler_zeisel", label = TRUE, repel = TRUE, shuffle = TRUE))
+
+#straggling bad clusters after first pass
+pls_object$cluster_before_removal = pls_object$seurat_clusters
+n_before = ncol(pls_object)
+
+
+drop_clusters = character(0)
+drop_clusters = c(drop_clusters, "20") # Doublet: 42.9% co-express oligo (Mobp/Mog/Plp1) + immune (Cd33/Cx3cr1/Il10ra) and bad UMAP signature
+
+pls_object = subset(pls_object, cells = colnames(pls_object)[
+  !(as.character(pls_object$cluster_before_removal) %in% drop_clusters)])
+message(sprintf("Second Pass, Before: %s | After: %s | Removed: %s (%.1f%%)",
+                format(n_before, big.mark = ","), format(ncol(pls_object), big.mark = ","),
+                format(n_before - ncol(pls_object), big.mark = ","),
+                100 * (n_before - ncol(pls_object)) / n_before))
+
+
+pls_object = NormalizeData(pls_object)
+pls_object = FindVariableFeatures(pls_object, selection.method = "vst", nfeatures = 2000)
+pls_object = ScaleData(pls_object)
+pls_object = RunPCA(pls_object, npcs = 50)
+pls_object = FindNeighbors(pls_object, dims = dims_used)
+pls_object = FindClusters(pls_object, resolution = 0.2)
+pls_object = RunUMAP(pls_object, dims = dims_used)
+
+print(DimPlot(pls_object, group.by = "seurat_clusters", label = TRUE, repel = TRUE) + NoLegend())
+print(DimPlot(pls_object, group.by = "singler_zeisel", label = TRUE, repel = TRUE, shuffle = TRUE))
+
+saveRDS(pls_object, file.path(wkdir, "pls_object_cleaned.rds"))
+```
+
+
+## In Depth annotation based on seurat cluster
+```{r Manual-Annotation}
+
+```
+
+
+## Differentially Expressed Genes, etc.
+```{r Differentially Expressed Genes}
+
+```
+
+## Volcano, Heatmaps, ETC.
+
+```{r plots}
+
+```

@@ -1,0 +1,18 @@
+{
+    "header": {
+        "description": "analysis processing",
+        "filekey": "SFR_ANA_PROC_DEF",
+        "version": "split-pipe v1.6.4",
+        "ver_number": "1.6.4",
+        "date": "2026-03-17"
+    },
+    "analysis": {
+        "status": "good",
+        "cluster_num": 28,
+        "cluster_alg": "leiden",
+        "cluster_min_bc": 30,
+        "cluster_1base": true,
+        "anndata_rows": 28967,
+        "anndata_cols": 23878
+    }
+}

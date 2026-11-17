@@ -1,0 +1,7 @@
+# Large R objects and sparse matrices: kept out of git.
+# See objects/README.md for what each file is and where to get it.
+*.rds
+*.mtx
+
+# Keep placeholder files for empty folders
+!.gitkeep

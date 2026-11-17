@@ -1,0 +1,23 @@
+{
+    "header": {
+        "description": "analysis processing",
+        "filekey": "SFR_ANA_PROC_DEF",
+        "version": "split-pipe v1.8.1",
+        "ver_number": "1.8.1",
+        "date": "2026-07-08"
+    },
+    "analysis": {
+        "status": "good",
+        "adata_o_rows": 29247,
+        "adata_o_cols": 30562,
+        "adata_u_rows": 29247,
+        "adata_u_cols": 24739,
+        "adata_subsample": 0,
+        "cluster_num": 31,
+        "cluster_alg": "leiden",
+        "cluster_cell_min": 30,
+        "cluster_cell_max": 100000,
+        "cluster_1base": true,
+        "gene_cell_min": 3
+    }
+}
